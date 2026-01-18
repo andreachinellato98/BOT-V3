@@ -4,6 +4,7 @@
 
 - node v23.6.1
 - npm v10.9.2
+- FFmpeg: It must be installed on your system PATH to handle local stream processing.
 
 ## Project setup
 

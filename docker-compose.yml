@@ -1,0 +1,17 @@
+version: '3.9'
+
+services:
+  dbot:
+    build: ./
+    env_file:
+      - ./.env
+    volumes:
+      - dbot-multimedia:/assets
+    networks:
+      - dbot
+
+volumes:
+  dbot-multimedia:
+
+networks:
+  dbot:

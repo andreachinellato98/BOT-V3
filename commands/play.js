@@ -1,11 +1,18 @@
-import { AudioPlayerStatus, createAudioPlayer, joinVoiceChannel, VoiceConnectionStatus, getVoiceConnection } from "@discordjs/voice";
+import { 
+  AudioPlayerStatus, 
+  createAudioPlayer, 
+  joinVoiceChannel, 
+  VoiceConnectionStatus, 
+  getVoiceConnection,
+  entersState 
+} from "@discordjs/voice";
 import youtubedl from "youtube-dl-exec";
 import { YouTube } from "youtube-sr";
 import playSong from "../playSong.js";
 import { parseFile } from "music-metadata";
 import path from "path";
 import { promisify } from "util";
-import { exec } from "child_process";
+import { exec, spawn } from "child_process";
 import fs from "fs";
 import { sendNowPlayingEmbed } from '../embedHandling/handleMusicButton.js';
 import { sendAddedQueue } from '../embedHandling/addedQueue.js';
@@ -31,7 +38,7 @@ const isValidURL = (string) => {
   }
 };
 
-const fetchYouTubeInfo = async (url) => {
+/*const fetchYouTubeInfo = async (url) => {
   return await youtubedl(url, {
     dumpSingleJson: true,
     noCheckCertificates: true,
@@ -39,6 +46,51 @@ const fetchYouTubeInfo = async (url) => {
     preferFreeFormats: true,
     addHeader: ["referer: https://www.youtube.com", "user-agent: Mozilla/5.0"],
     socketTimeout: 5
+  });
+};*/
+
+const fetchYouTubeInfo = async (url) => {
+  return new Promise((resolve, reject) => {
+    const ytProcess = spawn("yt-dlp", [
+      "--dump-single-json",
+      "--no-warnings",
+      "--no-check-certificates",
+      url
+    ], { stdio: ["ignore", "pipe", "pipe"] });
+
+    let stdout = "";
+    let stderr = "";
+
+    // Timeout di 15 secondi
+    const timeout = setTimeout(() => {
+      ytProcess.kill("SIGKILL");
+      reject(new Error("yt-dlp timeout after 15s"));
+    }, 15000);
+
+    ytProcess.stdout.on("data", (data) => stdout += data.toString());
+    ytProcess.stderr.on("data", (data) => {
+      console.log(`yt-dlp meta stderr: ${data.toString()}`); // DEBUG
+      stderr += data.toString();
+    });
+
+    ytProcess.on("close", (code) => {
+      clearTimeout(timeout);
+      console.log(`yt-dlp meta closed with code: ${code}`); // DEBUG
+      if (code !== 0) {
+        reject(new Error(stderr || `yt-dlp exited with code ${code}`));
+        return;
+      }
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        reject(new Error("Failed to parse yt-dlp JSON output"));
+      }
+    });
+
+    ytProcess.on("error", (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    });
   });
 };
 
@@ -405,19 +457,25 @@ export default {
       }
       // YOUTUBE
       else {
+        console.log("🔍 | Entering YouTube branch");
         let url = input;
         const videoId = extractVideoId(input);
 
         if (videoId) {
           url = `https://www.youtube.com/watch?v=${videoId}`;
         } else if (!isValidURL(input)) {
+          console.log("🔍 | Searching YouTube for:", input);
           const results = await YouTube.search(input, { limit: 1 });
+          console.log("🔍 | Search results:", results?.length);
           if (!results?.length) return interaction.editReply("❌ | No results");
           url = `https://www.youtube.com/watch?v=${results[0].id}`;
         }
 
+        console.log("🔍 | Fetching info for:", url);
+
         try {
           const info = await fetchYouTubeInfo(url);
+          console.log("✅ | Info fetched:", info.title);
           song = {
             url: url,
             title: info.title || input,
@@ -525,23 +583,50 @@ export default {
       connection.on(VoiceConnectionStatus.Disconnected, async () => {
         try {
           await Promise.race([
-            connection.reconnect(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
+            entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+            entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
+            //connection.reconnect(),
+            //new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 5000))
           ]);
         } catch {
-          connection.destroy();
+          if (!connection.destroyed) connection.destroy();
           queue.delete(interaction.guild.id);
         }
       });
 
       connection.on(VoiceConnectionStatus.Ready, async () => {
+        console.log("✅ | Voice connection Ready!");
         queueConstruct.connection = connection;
+        connection.subscribe(queueConstruct.player);
         playSong(interaction.guild, queueConstruct.songs[0], queue, true);
         await sendNowPlayingEmbed(interaction, song, queueConstruct);
         
-        const reply = await interaction.fetchReply();
-        queueConstruct.lastMessageId = reply.id;
+        try {
+          const reply = await interaction.fetchReply();
+          queueConstruct.lastMessageId = reply.id;
+        } catch (err) {
+          console.warn("⚠️ | Could not fetch reply:", err.message);
+        }
       });
+
+      connection.on(VoiceConnectionStatus.Connecting, () => {
+        console.log("🔄 | Voice connection Connecting...");
+      });
+
+      connection.on('stateChange', (oldState, newState) => {
+        console.log(`🔁 | Connection state: ${oldState.status} → ${newState.status}`);
+        
+        // Debug networking
+        if (newState.networking) {
+          newState.networking.on('stateChange', (o, n) => {
+            console.log(`🌐 | Networking state: ${o?.code ?? 'none'} → ${n?.code ?? 'none'}`);
+          });
+        }
+      });
+
+      connection.on("error", (error) => {
+      console.error("❌ | Connection error:", error);
+    });
 
     } catch (error) {
       console.error("❌ | Play error:", error);

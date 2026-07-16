@@ -19,6 +19,16 @@ The script needs a .env file inside the root directory, containing:
 - GUILD_ID
 - LOCAL_DIR_PATH
 
+## Spotify App Setup
+
+Register a new App on the website: https://developer.spotify.com/dashboard
+
+Then copy the two given variables in the .env file:
+- SPOTIFY_CLIENT_ID
+- SPOTIFY_CLIENT_SECRET
+
+For a better compatibility please update in the Dockerfile the latest yt-dlp version.
+
 ## Run
 
 ```bash

@@ -340,6 +340,187 @@ const searchArchive = async (query) => {
 
 // ---------- END ARCHIVE.ORG FUNCTIONS ----------
 
+// ------------ SPOTIFY FUNCTIONS ------------
+// Bridge: Spotify non permette lo streaming diretto dell'audio via API pubbliche,
+// quindi recupero solo i METADATI da Spotify (titolo, artisti, durata, cover)
+// e poi eseguo bridge su Youtube.
+
+const MAX_SPOTIFY_TRACKS = 50; // limite di sicurezza per playlist/album molto lunghi
+
+let spotifyToken = null;
+let spotifyTokenExpiry = 0;
+
+const isSpotifyUrl = (input) => {
+  try {
+    const url = new URL(input);
+    return url.hostname.includes("spotify.com") &&
+      /\/(track|album|playlist)\//.test(url.pathname);
+  } catch {
+    return false;
+  }
+};
+
+const extractSpotifyInfo = (input) => {
+  try {
+    const url = new URL(input);
+    const parts = url.pathname.split("/").filter(Boolean);
+    // Supporta anche varianti localizzate tipo /intl-it/track/{id}
+    const typeIndex = parts.findIndex(p => ["track", "album", "playlist"].includes(p));
+    if (typeIndex === -1 || !parts[typeIndex + 1]) return null;
+    return {
+      type: parts[typeIndex],
+      id: parts[typeIndex + 1].split("?")[0]
+    };
+  } catch {
+    return null;
+  }
+};
+
+const getSpotifyToken = async () => {
+  if (spotifyToken && Date.now() < spotifyTokenExpiry) {
+    return spotifyToken;
+  }
+
+  const clientId = process.env.SPOTIFY_CLIENT_ID;
+  const clientSecret = process.env.SPOTIFY_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    throw new Error("SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET not set");
+  }
+
+  const authString = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+
+  const response = await fetch("https://accounts.spotify.com/api/token", {
+    method: "POST",
+    headers: {
+      "Authorization": `Basic ${authString}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: "grant_type=client_credentials"
+  });
+
+  if (!response.ok) {
+    throw new Error(`Spotify auth failed: HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  spotifyToken = data.access_token;
+  // rinnovo con 60s di margine prima della scadenza reale
+  spotifyTokenExpiry = Date.now() + (data.expires_in - 60) * 1000;
+  return spotifyToken;
+};
+
+const fetchSpotifyTrack = async (trackId) => {
+  const token = await getSpotifyToken();
+  const response = await fetch(`https://api.spotify.com/v1/tracks/${trackId}`, {
+    headers: { "Authorization": `Bearer ${token}` }
+  });
+
+  if (!response.ok) {
+    throw new Error(`Spotify track fetch failed: HTTP ${response.status}`);
+  }
+
+  const data = await response.json();
+  return {
+    title: data.name,
+    artists: data.artists.map(a => a.name).join(", "),
+    durationMs: data.duration_ms,
+    thumbnail: data.album?.images?.[0]?.url || null
+  };
+};
+
+const fetchSpotifyPlaylistTracks = async (playlistId) => {
+  const token = await getSpotifyToken();
+  const tracks = [];
+  let url = `https://api.spotify.com/v1/playlists/${playlistId}/tracks?limit=100`;
+
+  while (url && tracks.length < MAX_SPOTIFY_TRACKS) {
+    const response = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
+    if (!response.ok) {
+      throw new Error(`Spotify playlist fetch failed: HTTP ${response.status}`);
+    }
+    const data = await response.json();
+
+    for (const item of data.items) {
+      if (!item.track) continue; // traccia rimossa o locale
+      tracks.push({
+        title: item.track.name,
+        artists: item.track.artists.map(a => a.name).join(", "),
+        durationMs: item.track.duration_ms,
+        thumbnail: item.track.album?.images?.[0]?.url || null
+      });
+      if (tracks.length >= MAX_SPOTIFY_TRACKS) break;
+    }
+
+    url = data.next;
+  }
+
+  return tracks;
+};
+
+const fetchSpotifyAlbumTracks = async (albumId) => {
+  const token = await getSpotifyToken();
+
+  const albumResponse = await fetch(`https://api.spotify.com/v1/albums/${albumId}`, {
+    headers: { "Authorization": `Bearer ${token}` }
+  });
+  if (!albumResponse.ok) {
+    throw new Error(`Spotify album fetch failed: HTTP ${albumResponse.status}`);
+  }
+  const albumData = await albumResponse.json();
+  const thumbnail = albumData.images?.[0]?.url || null;
+
+  const tracks = [];
+  let url = `https://api.spotify.com/v1/albums/${albumId}/tracks?limit=50`;
+
+  while (url && tracks.length < MAX_SPOTIFY_TRACKS) {
+    const response = await fetch(url, { headers: { "Authorization": `Bearer ${token}` } });
+    if (!response.ok) {
+      throw new Error(`Spotify album tracks fetch failed: HTTP ${response.status}`);
+    }
+    const data = await response.json();
+
+    for (const item of data.items) {
+      tracks.push({
+        title: item.name,
+        artists: item.artists.map(a => a.name).join(", "),
+        durationMs: item.duration_ms,
+        thumbnail
+      });
+      if (tracks.length >= MAX_SPOTIFY_TRACKS) break;
+    }
+
+    url = data.next;
+  }
+
+  return tracks;
+};
+
+// Prende una traccia Spotify (metadati) e trova il video YouTube corrispondente
+const bridgeSpotifyTrackToYouTube = async (spotifyTrack) => {
+  const query = `${spotifyTrack.artists} - ${spotifyTrack.title}`;
+  const results = await YouTube.search(query, { limit: 1 });
+
+  if (!results?.length) {
+    throw new Error(`No YouTube match for "${query}"`);
+  }
+
+  const url = `https://www.youtube.com/watch?v=${results[0].id}`;
+  const info = await fetchYouTubeInfo(url);
+
+  return {
+    url,
+    title: query,
+    lengthSeconds: Math.floor(
+      info.duration || (spotifyTrack.durationMs ? spotifyTrack.durationMs / 1000 : 0)
+    ),
+    thumbnail: spotifyTrack.thumbnail || info.thumbnail || info.thumbnails?.[0]?.url || null,
+    sourceFrom: 'spotify'
+  };
+};
+
+// ---------- END SPOTIFY FUNCTIONS ----------
+
 export default {
   name: "play",
   description: "Play a song or playlist",
@@ -371,7 +552,9 @@ export default {
       serverQueue = null;
     }
 
-    let song = {};
+    // Ogni ramo popola questo array. Anche un singolo brano è un array di 1 elemento,
+    // così la gestione della coda più sotto è unificata per tutte le sorgenti.
+    let songs = [];
 
     try {
       // FILE LOCALI
@@ -399,14 +582,14 @@ export default {
           console.warn("⚠️ | Duration unavailable");
         }
 
-        song = {
+        songs.push({
           url: null,
           title: matchingFile,
           lengthSeconds: duration,
           localPath: fullPath,
           thumbnail: null,
           sourceFrom: 'local'
-        };
+        });
       }
       // ARCHIVE.ORG
       else if (isArchiveUrl(input)) {
@@ -418,11 +601,57 @@ export default {
         try {
           console.log(`🎵 | Fetching Archive.org: ${result.identifier}${result.filename ? ` / ${result.filename}` : ''}`);
           const archiveInfo = await fetchArchiveInfo(result.identifier, result.filename);
-          song = archiveInfo;
-          console.log(`✅ | Archive.org found: ${song.title}`);
+          songs.push(archiveInfo);
+          console.log(`✅ | Archive.org found: ${archiveInfo.title}`);
         } catch (err) {
           console.error("❌ | Archive.org fetch failed:", err.message);
           return interaction.editReply(`❌ | Failed to fetch from Archive.org: ${err.message}`);
+        }
+      }
+      // SPOTIFY (bridge verso YouTube)
+      else if (isSpotifyUrl(input)) {
+        const spotifyInfo = extractSpotifyInfo(input);
+        if (!spotifyInfo) {
+          return interaction.editReply("❌ | Invalid Spotify URL. Usa un link track/album/playlist di Spotify.");
+        }
+
+        try {
+          if (spotifyInfo.type === "track") {
+            console.log(`🎵 | Fetching Spotify track: ${spotifyInfo.id}`);
+            const track = await fetchSpotifyTrack(spotifyInfo.id);
+            const bridged = await bridgeSpotifyTrackToYouTube(track);
+            songs.push(bridged);
+            console.log(`✅ | Spotify bridged: ${bridged.title}`);
+          } else {
+            console.log(`🎵 | Fetching Spotify ${spotifyInfo.type}: ${spotifyInfo.id}`);
+            const tracks = spotifyInfo.type === "playlist"
+              ? await fetchSpotifyPlaylistTracks(spotifyInfo.id)
+              : await fetchSpotifyAlbumTracks(spotifyInfo.id);
+
+            if (!tracks.length) {
+              return interaction.editReply("❌ | Nessuna traccia trovata in questa playlist/album Spotify.");
+            }
+
+            await interaction.editReply(
+              `🔄 | Trovate ${tracks.length} tracce su Spotify, sto cercando i corrispettivi su YouTube (potrebbe volerci un po')...`
+            );
+
+            for (const track of tracks) {
+              try {
+                const bridged = await bridgeSpotifyTrackToYouTube(track);
+                songs.push(bridged);
+              } catch (err) {
+                console.warn(`⚠️ | Skip traccia Spotify "${track.title}": ${err.message}`);
+              }
+            }
+
+            if (!songs.length) {
+              return interaction.editReply("❌ | Nessuna traccia Spotify è stata trovata su YouTube.");
+            }
+          }
+        } catch (err) {
+          console.error("❌ | Spotify fetch failed:", err.message);
+          return interaction.editReply(`❌ | Failed to fetch from Spotify: ${err.message}`);
         }
       }
       else if (isBitchuteUrl(input)) {
@@ -436,23 +665,23 @@ export default {
         
         try {
           const info = await fetchBitchuteInfo(videoId);
-          song = {
+          songs.push({
             url: url,
             title: info.title || "Unknown Title",
             lengthSeconds: 0,
             thumbnail: info.thumbnail || null,
             sourceFrom: 'bitchute'
-          };
+          });
         } catch (err) {
           console.error("❌ | Bitchute fetch failed:", err.message);
 
-          song = {
+          songs.push({
             url: url,
             title: `Bitchute Video ${videoId}`,
             lengthSeconds: 0,
             thumbnail: null,
             sourceFrom: 'bitchute'
-          };
+          });
         }
       }
       // YOUTUBE
@@ -476,29 +705,31 @@ export default {
         try {
           const info = await fetchYouTubeInfo(url);
           console.log("✅ | Info fetched:", info.title);
-          song = {
+          songs.push({
             url: url,
             title: info.title || input,
             lengthSeconds: Math.floor(info.duration || 0),
             thumbnail: info.thumbnail || info.thumbnails?.[0]?.url || null,
             sourceFrom: 'youtube'
-          };
+          });
         } catch (err) {
           console.error("❌ | YouTube fetch failed:", err.message);
           if (isValidURL(input)) {
-            song = { url: input, title: "Unknown", lengthSeconds: 0, thumbnail: null, sourceFrom: 'unknown' };
+            songs.push({ url: input, title: "Unknown", lengthSeconds: 0, thumbnail: null, sourceFrom: 'unknown' });
           } else {
             return interaction.editReply("🚫 | Metadata failed. Use direct URL.");
           }
         }
       }
 
+      const song = songs[0];
+
       // GESTIONE CODA
       serverQueue = queue.get(interaction.guild.id);
 
       // Aggiungo a coda esistente
       if (serverQueue?.songs?.length > 0) {
-        serverQueue.songs.push(song);
+        serverQueue.songs.push(...songs);
         await sendAddedQueue(interaction, song, serverQueue);
         if (serverQueue.player.state.status === AudioPlayerStatus.Idle) {
           playSong(interaction.guild, serverQueue.songs[0], queue, true);
@@ -511,7 +742,7 @@ export default {
         if (serverQueue.ffmpegProcess) serverQueue.ffmpegProcess.kill('SIGKILL');
         if (serverQueue.disconnectTimeout) clearTimeout(serverQueue.disconnectTimeout);
         serverQueue.player.removeAllListeners();
-        serverQueue.songs.push(song);
+        serverQueue.songs.push(...songs);
         
         if (serverQueue.connection && !serverQueue.connection.destroyed) {
           playSong(interaction.guild, serverQueue.songs[0], queue, true);
@@ -527,7 +758,7 @@ export default {
           voiceChannel: voiceChannel,
           connection: existingConnection,
           player: createAudioPlayer(),
-          songs: [song],
+          songs: songs,
           playing: true,
           reproduction: { startTimestamp: null, playedTime: 0, isPaused: false },
           lastMessageId: null,
@@ -552,7 +783,7 @@ export default {
         voiceChannel: voiceChannel,
         connection: null,
         player: createAudioPlayer(),
-        songs: [song],
+        songs: songs,
         playing: true,
         reproduction: { startTimestamp: null, playedTime: 0, isPaused: false },
         lastMessageId: null,
